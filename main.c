@@ -146,17 +146,16 @@ void UserAPeriodicTask(TaskParams* params){
 }
 
 static void userTaskDelay(uint32_t delay_time){
-//	uint32_t prev = xTaskGetTickCount();
-//	uint32_t curr;
-//	uint32_t remaining = delay_time;
-//	while(remaining>0){
-//		curr = xTaskGetTickCount();
-//		if(curr>prev){
-//			remaining--;
-//			prev=curr;
-//		}
-//	}
-	vTaskDelay(delay_time);
+	uint32_t prev = xTaskGetTickCount();
+	uint32_t curr;
+	uint32_t remaining = delay_time;
+	while(remaining>0){
+		curr = xTaskGetTickCount();
+		if(curr>prev){
+			remaining--;
+			prev=curr;
+		}
+	}
 }
 
 /*
@@ -203,13 +202,15 @@ void dd_tcreate(TaskParams *params){
 // Returns the active list
 TaskList* dd_return_active_list(){
 	TaskParams params = {.task_id = ACTIVE};
-	return getList(params);
+	TaskList* list = getList(params);
+	return list;
 }
 
 // Returns the overdue list
 TaskList* dd_return_overdue_list(){
 	TaskParams params = {.task_id = OVERDUE};
-	return getList(params);
+	TaskList* list = getList(params);
+	return list;
 }
 
 // Returns a generic list
@@ -220,14 +221,14 @@ TaskList* getList(TaskParams params){
 	SchedulerMessage message = {TaskQueue, params};
 	xQueueSend(SchedulerQueue, &message, 50);
 
-	TaskList *list;
-	xQueueReceive(TaskQueue, list, 5000);
+	TaskList *list = NULL;
+	xQueueReceive(TaskQueue, &list, 5000);
 
 	//do something with the response code
 
 	vQueueUnregisterQueue( TaskQueue );
 	vQueueDelete( TaskQueue );
-	return list;
+	return (list);
 }
 
 /*
@@ -328,10 +329,10 @@ void DD_Scheduler_Task(){
 				addToList(entry, &overdue);
 			//dd_return_active_list
 			}else if(message.params.task_id==ACTIVE){
-				xQueueSend(message.queue, active, 50);
+				xQueueSend(message.queue, &active, 50);
 			//dd_return_overdue_list
 			}else if(message.params.task_id==OVERDUE){
-				xQueueSend(message.queue, overdue, 50);
+				xQueueSend(message.queue, &overdue, 50);
 			}else{
 				if(message.params.command==DELETE){
 					TaskList *entry = removeFromActiveList(message.params, &active);
@@ -351,29 +352,29 @@ void DD_Scheduler_Task(){
 }
 
 void Generator_Task1(){
-	TaskParams params = {.period = 2000, .deadline = 1000, .execution_time=500, .task_type=PERIODIC};
+	TaskParams params = {.period = 4000, .deadline = 1000, .execution_time=500, .task_type=PERIODIC};
 	for(;;){
-//		printf("Generating new task1\n");
+		printf("Generating new task1\n");
 		dd_tcreate(&params);
 		vTaskDelay(params.period);
 	}
 }
 
 void Generator_Task2(){
-	TaskParams params = {.period = 2000, .deadline = 600, .execution_time=250, .task_type=PERIODIC};
+	TaskParams params = {.period = 4000, .deadline = 600, .execution_time=250, .task_type=PERIODIC};
 	vTaskDelay(250);
 	for(;;){
-//		printf("Generating new task2\n");
+		printf("Generating new task2\n");
 		dd_tcreate(&params);
 		vTaskDelay(params.period);
 	}
 }
 
 void Generator_Task3(){
-	TaskParams params = {.period = 2000, .deadline = 200, .execution_time=100, .task_type=PERIODIC};
+	TaskParams params = {.period = 4000, .deadline = 200, .execution_time=100, .task_type=PERIODIC};
 	vTaskDelay(4100);
 	for(;;){
-//		printf("Generating new task3\n");
+		printf("Generating new task3\n");
 		dd_tcreate(&params);
 		vTaskDelay(params.period);
 	}
@@ -381,24 +382,26 @@ void Generator_Task3(){
 
 // Used to check the processor utilization
 void Processor_Delay(TimerHandle_t xTimer){
-	TaskList* list = dd_return_active_list();
-	if(list!=NULL){
+	TaskList* active = dd_return_active_list();
+	TaskList* overdue = dd_return_overdue_list();
+	if(active!=NULL){
 		ACTIVE_COUNTER++;
+		printf("Active list highest priority: {deadline: %d, execution_time: %d, creation_time: %d}\n",active->params.deadline, active->params.execution_time,active->params.creation_time);
 	}else{
 		IDLE_COUNTER++;
+	}
+	if(overdue!=NULL){
+		printf("overdue list head: {deadline: %d, execution_time: %d, creation_time: %d}\n",overdue->params.deadline, overdue->params.execution_time, overdue->params.creation_time);
 	}
 }
 
 
-//Monitors the
+//Monitors the tasks
 void Monitor_Task(){
 	for(;;){
-		printf("Processor utilization: %d",ACTIVE_COUNTER/IDLE_COUNTER);
-		TaskList* active = dd_return_active_list();
-		TaskList* overdue = dd_return_overdue_list();
-		printf("Active list highest priority: {deadline: %d, execution_time: %d, creation_time: %d}\n",active->params.deadline, active->params.execution_time,active->params.creation_time);
-		printf("overdue list head: {deadline: %d, execution_time: %d, creation_time: %d}\n",overdue->params.deadline, overdue->params.execution_time, overdue->params.creation_time);
-
+		printf("Processor utilization %d/%d\n",ACTIVE_COUNTER,(IDLE_COUNTER+ACTIVE_COUNTER));
+		IDLE_COUNTER++;
+		vTaskDelay(500);
 	}
 }
 
@@ -406,7 +409,7 @@ int main(void) {
   prvSetupHardware();
 
   //start the timer to monitor
-  TimerHandle_t timer = xTimerCreate("watch_processor", 5, pdTRUE, (void *)0, Processor_Delay);
+  TimerHandle_t timer = xTimerCreate("watch_processor", 500, pdTRUE, (void *)0, Processor_Delay);
   xTimerStart(timer, 0);
 
   // Initialize the four queues needed to communicate
@@ -415,12 +418,18 @@ int main(void) {
   // Add the queues to the registry
   vQueueAddToRegistry(SchedulerQueue, "SchedulerQueue");
 
+  //Periodic tasks
   xTaskCreate(Generator_Task1, "Generator1", configMINIMAL_STACK_SIZE, NULL, HIGH, NULL);
   xTaskCreate(Generator_Task2, "Generator2", configMINIMAL_STACK_SIZE, NULL, HIGH, NULL);
   xTaskCreate(Generator_Task3, "Generator3", configMINIMAL_STACK_SIZE, NULL, HIGH, NULL);
 
+  //APeriodic tasks
+//  TaskParams params = {.period = 2000, .deadline = 1500, .execution_time=400, .task_type=PERIODIC};
+//  xTaskCreate(UserAPeriodicTask, "Aperiodic_task", configMINIMAL_STACK_SIZE, &params, HIGH, NULL);
 
+  //Scheduler
   xTaskCreate(DD_Scheduler_Task, "DDScheduler", configMINIMAL_STACK_SIZE, NULL, SCHEDULER, NULL);
+  //Monitor
   xTaskCreate(Monitor_Task, "MonitorTask", configMINIMAL_STACK_SIZE, NULL, MONITOR, NULL);
 
   // Start the scheduler
