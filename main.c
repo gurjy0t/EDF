@@ -13,6 +13,11 @@
 #include "../FreeRTOS_Source/include/timers.h"
 #include "stm32f4xx.h"
 
+#define green  	0
+#define amber  	1
+#define red  	2
+#define blue  	3
+
 typedef unsigned char BYTE;
 
 uint32_t CREATE = 0;
@@ -33,6 +38,10 @@ uint32_t SCHEDULER = 5;
 uint32_t ACTIVE_COUNTER=0;
 uint32_t IDLE_COUNTER=0;
 
+uint32_t MONITORING=0;
+
+uint32_t MAX_LIST_LENGTH=5;
+
 
 TimerHandle_t timer;
 
@@ -49,6 +58,7 @@ typedef struct TaskParams{
 	uint32_t execution_time;
 	uint32_t creation_time;
 	uint32_t period;
+	uint32_t light;
 	TaskHandle_t task_id;
 	TimerHandle_t timer;
 	uint32_t command;
@@ -84,6 +94,8 @@ void Generator_Task();
 void Monitor_Task();
 void startGenerators();
 static void userTaskDelay(uint32_t delay_time);
+void turnLightOn(int light);
+void turnLightOff();
 
 /*
  * Parameters: Task handle
@@ -140,21 +152,28 @@ void UserPeriodicTask(TaskParams* params){
  */
 void UserAPeriodicTask(TaskParams* params){
 	//delay
-	userTaskDelay(params->execution_time);
-	xTimerDelete(params->timer, 0);
-	dd_delete(params->task_id);
+	for(;;){
+		userTaskDelay(params->execution_time);
+		xTimerDelete(params->timer, 0);
+		dd_delete(params->task_id);
+	}
 }
 
 static void userTaskDelay(uint32_t delay_time){
-	uint32_t prev = xTaskGetTickCount();
-	uint32_t curr;
-	uint32_t remaining = delay_time;
-	while(remaining>0){
-		curr = xTaskGetTickCount();
-		if(curr>prev){
-			remaining--;
-			prev=curr;
+	if(!MONITORING){
+		uint32_t prev = xTaskGetTickCount();
+		uint32_t curr;
+		uint32_t remaining = delay_time;
+		while(remaining>0){
+			curr = xTaskGetTickCount();
+			if(curr>prev){
+				remaining--;
+				prev=curr;
+			}
 		}
+	}
+	else{
+	 vTaskDelay(delay_time);
 	}
 }
 
@@ -243,12 +262,18 @@ TaskList* removeFromActiveList(TaskParams params, TaskList **list){
 //	uint32_t normalized_time = ticks;
 	TaskList *curr = (*list);
 	TaskList *prev = NULL;
+	//Find the one to remove
 	while(curr->params.task_id!=params.task_id && curr->params.timer!=params.timer){
 		prev = curr;
 		curr=curr->next;
+		if(curr==NULL){
+			return *list;
+		}
 	}
+	//If the one to remove is head
 	if(prev==NULL){
 		(*list) = curr->next;
+		(*list)->prev = NULL;
 		vTaskPrioritySet((*list)->params.task_id, MEDIUM);
 //		printf("Increasing priority DELETE: {deadline: %d, execution_time: %d, creation_time: %d, current_time: %d}\n",(*list)->params.deadline, (*list)->params.execution_time,(*list)->params.creation_time, normalized_time);
 		return curr;
@@ -285,15 +310,17 @@ void addToList(TaskList* entry, TaskList **list){
 	if((prev->params.creation_time+prev->params.deadline)>(entry->params.creation_time+entry->params.deadline)){
 //		printf("Lowering priority: {deadline: %d, execution_time: %d, creation_time: %d, current_time: %d}\n",(*list)->params.deadline, (*list)->params.execution_time,(*list)->params.creation_time, normalized_time);
 		vTaskPrioritySet((*list)->params.task_id, LOW);
+		entry->next = (*list);
+		entry->prev = NULL;
+		if ((*list)!=NULL){
+			(*list)->prev = entry;
+		}
 		(*list) = entry;
-		(*list)->next = prev;
-		prev->prev = (*list);
-		prev->next = NULL;
 		vTaskPrioritySet((*list)->params.task_id, MEDIUM);
 //		printf("Increasing priority: {deadline: %d, execution_time: %d, creation_time: %d, current_time: %d}\n",(*list)->params.deadline, (*list)->params.execution_time,(*list)->params.creation_time, normalized_time);
 		return;
 	}
-	while(curr!=NULL && entry->params.deadline > curr->params.deadline){
+	while(curr!=NULL && (entry->params.creation_time+entry->params.deadline) > (curr->params.creation_time+curr->params.deadline)){
 		prev = curr;
 		curr=curr->next;
 	}
@@ -301,6 +328,7 @@ void addToList(TaskList* entry, TaskList **list){
 	if(curr==NULL){
 		prev->next = entry;
 		entry->prev = prev;
+		entry->next=NULL;
 		return;
 	}
 	//Inserting middle
@@ -308,6 +336,23 @@ void addToList(TaskList* entry, TaskList **list){
 	entry->next = curr;
 	entry->prev = prev;
 	curr->prev = entry;
+}
+
+
+void limitLength(TaskList **list){
+	TaskList *curr = (*list);
+	int counter=0;
+	while(curr!=NULL){
+		counter++;
+		curr=curr->next;
+		if(counter>MAX_LIST_LENGTH){
+			TaskList *temp = (*list);
+			(*list) = (*list)->next;
+			vPortFree(temp);
+			return;
+		}
+	}
+	return counter;
 }
 
 /*
@@ -322,11 +367,20 @@ void DD_Scheduler_Task(){
 	TaskList *overdue = NULL;
 	for(;;){
 		if (xQueueReceive(SchedulerQueue, &message, 50000)){
+			if(active!=NULL){
+				turnLightOn(active->params.light);
+			}else{
+				turnLightOff();
+			}
+//			printf("Heap size: %d, free space: %d\n", configTOTAL_HEAP_SIZE, xPortGetFreeHeapSize());
 			//timer message
 			if(message.params.task_id==TIMER){
 				TaskList *entry = removeFromActiveList(message.params, &active);
+				entry->next = NULL;
+				entry->prev = NULL;
 				vTaskDelete(entry->params.task_id);
 				addToList(entry, &overdue);
+				limitLength(&overdue);
 			//dd_return_active_list
 			}else if(message.params.task_id==ACTIVE){
 				xQueueSend(message.queue, &active, 50);
@@ -336,10 +390,12 @@ void DD_Scheduler_Task(){
 			}else{
 				if(message.params.command==DELETE){
 					TaskList *entry = removeFromActiveList(message.params, &active);
-					free(entry);
+					vPortFree(entry);
 					xQueueSend(message.queue, 1, 50);
 				}else{
-					TaskList *entry = (TaskList*)malloc(sizeof(TaskList));
+					TaskList *entry = (TaskList*)pvPortMalloc(sizeof(TaskList));
+					entry->next = NULL;
+					entry->prev = NULL;
 					entry->params = message.params;
 					TickType_t ticks = xTaskGetTickCount();
 					entry->params.creation_time = ticks;
@@ -352,32 +408,79 @@ void DD_Scheduler_Task(){
 }
 
 void Generator_Task1(){
-	TaskParams params = {.period = 4000, .deadline = 1000, .execution_time=500, .task_type=PERIODIC};
+	//Example 1: Blue, Green, Red rotating(no pre-empt)
+	//TaskParams params = {.period = 5000, .deadline = 4997, .execution_time=1000, .task_type=PERIODIC, .light=blue};
+
+	//Example 2: Blue(pre-empted), Green(pre-empted), Red, Green, Blue
+	//TaskParams params = {.period = 5000, .deadline = 5000, .execution_time=1000, .task_type=PERIODIC, .light=blue};
+
+	//Test Bench 1:
+	TaskParams params = {.period = 5000, .deadline = 4999, .execution_time=950, .task_type=PERIODIC, .light=blue};
+
 	for(;;){
-		printf("Generating new task1\n");
 		dd_tcreate(&params);
 		vTaskDelay(params.period);
 	}
 }
 
 void Generator_Task2(){
-	TaskParams params = {.period = 4000, .deadline = 600, .execution_time=250, .task_type=PERIODIC};
-	vTaskDelay(250);
+	//Example 1:
+	//TaskParams params = {.period = 5000, .deadline = 4998, .execution_time=1000, .task_type=PERIODIC, .light=green};
+	//vTaskDelay(1500);
+
+
+	//Example 2:
+	//TaskParams params = {.period = 5000, .deadline = 4000, .execution_time=1000, .task_type=PERIODIC, .light=green};
+	//vTaskDelay(500);
+
+	//Test Bench 1:
+	TaskParams params = {.period = 5000, .deadline = 5000, .execution_time=1500, .task_type=PERIODIC, .light=green};
+
 	for(;;){
-		printf("Generating new task2\n");
 		dd_tcreate(&params);
 		vTaskDelay(params.period);
 	}
 }
 
 void Generator_Task3(){
-	TaskParams params = {.period = 4000, .deadline = 200, .execution_time=100, .task_type=PERIODIC};
-	vTaskDelay(4100);
+	//Example 1:
+	//TaskParams params = {.period = 5000, .deadline = 4999, .execution_time=1000, .task_type=PERIODIC, .light=red};
+	//vTaskDelay(3000);
+
+	//Example 2:
+	//TaskParams params = {.period = 5000, .deadline = 2500, .execution_time=1000, .task_type=PERIODIC, .light=red};
+	//vTaskDelay(1000);
+
+	//Test Bench 1:
+	TaskParams params = {.period = 7500, .deadline = 7500, .execution_time=2500, .task_type=PERIODIC, .light=red};
+
 	for(;;){
-		printf("Generating new task3\n");
 		dd_tcreate(&params);
 		vTaskDelay(params.period);
 	}
+}
+
+void Aperiodic_Generator(){
+	TaskParams params = {.period = 750, .deadline = 750, .execution_time=250, .task_type=APERIODIC};
+	dd_tcreate(&params);
+	for(;;){
+		vTaskDelay(500000);
+	}
+}
+
+void turnLightOff(){
+	STM_EVAL_LEDOff(green);
+	STM_EVAL_LEDOff(red);
+	STM_EVAL_LEDOff(blue);
+	STM_EVAL_LEDOff(amber);
+}
+
+void turnLightOn(int light){
+	STM_EVAL_LEDOff(green);
+	STM_EVAL_LEDOff(red);
+	STM_EVAL_LEDOff(blue);
+	STM_EVAL_LEDOff(amber);
+	STM_EVAL_LEDOn(light);
 }
 
 // Used to check the processor utilization
@@ -386,31 +489,45 @@ void Processor_Delay(TimerHandle_t xTimer){
 	TaskList* overdue = dd_return_overdue_list();
 	if(active!=NULL){
 		ACTIVE_COUNTER++;
-		printf("Active list highest priority: {deadline: %d, execution_time: %d, creation_time: %d}\n",active->params.deadline, active->params.execution_time,active->params.creation_time);
 	}else{
 		IDLE_COUNTER++;
-	}
-	if(overdue!=NULL){
-		printf("overdue list head: {deadline: %d, execution_time: %d, creation_time: %d}\n",overdue->params.deadline, overdue->params.execution_time, overdue->params.creation_time);
 	}
 }
 
 
 //Monitors the tasks
 void Monitor_Task(){
+	TaskList* active;
+	TaskList* overdue;
 	for(;;){
+		active = dd_return_active_list();
+		overdue = dd_return_overdue_list();
 		printf("Processor utilization %d/%d\n",ACTIVE_COUNTER,(IDLE_COUNTER+ACTIVE_COUNTER));
+		if(MONITORING){
+			if(active!=NULL){
+				printf("Active list highest priority: {deadline: %d, execution_time: %d, creation_time: %d}\n",active->params.deadline, active->params.execution_time,active->params.creation_time);
+			}
+			if(overdue!=NULL){
+				printf("overdue list head: {deadline: %d, execution_time: %d, creation_time: %d}\n",overdue->params.deadline, overdue->params.execution_time, overdue->params.creation_time);
+			}
+		}
 		IDLE_COUNTER++;
 		vTaskDelay(500);
 	}
 }
 
+
 int main(void) {
+  STM_EVAL_LEDInit(amber);
+  STM_EVAL_LEDInit(green);
+  STM_EVAL_LEDInit(red);
+  STM_EVAL_LEDInit(blue);
+
   prvSetupHardware();
 
   //start the timer to monitor
-  TimerHandle_t timer = xTimerCreate("watch_processor", 500, pdTRUE, (void *)0, Processor_Delay);
-  xTimerStart(timer, 0);
+  TimerHandle_t monitor_timer = xTimerCreate("watch_processor", 5, pdTRUE, (void *)0, Processor_Delay);
+  xTimerStart(monitor_timer, 0);
 
   // Initialize the four queues needed to communicate
   SchedulerQueue = xQueueCreate(QUEUE_LENGTH, sizeof(SchedulerMessage));
@@ -423,14 +540,13 @@ int main(void) {
   xTaskCreate(Generator_Task2, "Generator2", configMINIMAL_STACK_SIZE, NULL, HIGH, NULL);
   xTaskCreate(Generator_Task3, "Generator3", configMINIMAL_STACK_SIZE, NULL, HIGH, NULL);
 
-  //APeriodic tasks
-//  TaskParams params = {.period = 2000, .deadline = 1500, .execution_time=400, .task_type=PERIODIC};
-//  xTaskCreate(UserAPeriodicTask, "Aperiodic_task", configMINIMAL_STACK_SIZE, &params, HIGH, NULL);
-
   //Scheduler
   xTaskCreate(DD_Scheduler_Task, "DDScheduler", configMINIMAL_STACK_SIZE, NULL, SCHEDULER, NULL);
   //Monitor
   xTaskCreate(Monitor_Task, "MonitorTask", configMINIMAL_STACK_SIZE, NULL, MONITOR, NULL);
+
+  //APeriodic task
+//  xTaskCreate(Aperiodic_Generator, "Aperiodic_Generator", configMINIMAL_STACK_SIZE, NULL, HIGH, NULL);
 
   // Start the scheduler
   vTaskStartScheduler();
